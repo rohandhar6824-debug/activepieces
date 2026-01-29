@@ -57,22 +57,98 @@ export const websocketService = {
                 })
             }
         }
+
+        // Add socket-level error handler
+        socket.on('error', (error) => {
+            log.error({
+                message: 'Socket error occurred',
+                error: error instanceof Error ? error.message : String(error),
+                principalId: principal.id,
+                projectId,
+            })
+        })
+
+        // Register all event listeners with safe error handling
         for (const [event, handler] of Object.entries(listener[castedType])) {
-            socket.on(event, async (data, callback) => rejectedPromiseHandler(handler(socket)(data, principal, projectId, callback), log))
+            socket.on(event, async (data, callback) => {
+                try {
+                    const handlerPromise = handler(socket)(data, principal, projectId, callback)
+                    await rejectedPromiseHandler(handlerPromise, log)
+                } catch (error) {
+                    log.error({
+                        message: `Websocket handler failed for event: ${event}`,
+                        error: error instanceof Error ? {
+                            message: error.message,
+                            stack: (error as Error).stack ?? 'No stack trace',  
+                            name: error.name
+                        } : String(error),
+                        principalId: principal.id,
+                        projectId,
+                        event,
+                        data: JSON.stringify(data ?? {}).substring(0, 500), 
+                    })
+                    
+                    if (typeof callback === 'function') {
+                        try {
+                            callback({ 
+                                success: false, 
+                                error: 'Internal server error in websocket handler',
+                                timestamp: new Date().toISOString()
+                            })
+                        } catch (callbackError) {
+                            log.error('Failed to send error callback to client', { 
+                                callbackError: callbackError instanceof Error ? callbackError.message : String(callbackError),
+                                event,
+                                principalId: principal.id
+                            })
+                        }
+                    }
+                }
+            })
         }
+
+        // Handle CONNECT event with error protection
         for (const handler of Object.values(listener[castedType][WebsocketServerEvent.CONNECT] ?? {})) {
-            handler(socket)
+            try {
+                handler(socket)
+            } catch (error) {
+                log.error({
+                    message: 'Websocket CONNECT handler failed',
+                    error: error instanceof Error ? error.message : String(error),
+                    principalId: principal.id,
+                    projectId,
+                })
+            }
         }
     },
     async onDisconnect(socket: Socket): Promise<void> {
         const principal = await websocketService.verifyPrincipal(socket)
         const castedType = principal.type as keyof typeof listener
+        
         for (const handler of Object.values(listener[castedType][WebsocketServerEvent.DISCONNECT] ?? {})) {
-            handler(socket)
+            try {
+                handler(socket)
+            } catch (error) {
+                console.error('Websocket DISCONNECT handler failed:', {
+                    error: error instanceof Error ? error.message : String(error),
+                    principalId: principal.id,
+                    principalType: principal.type as string, 
+                })
+            }
         }
     },
     async verifyPrincipal(socket: Socket): Promise<Principal> {
-        return accessTokenManager.verifyPrincipal(socket.handshake.auth.token)
+        try {
+            return await accessTokenManager.verifyPrincipal(socket.handshake.auth.token)
+        } catch (error) {
+            throw new ActivepiecesError({
+                code: ErrorCode.AUTHENTICATION,
+                params: {
+                    message: 'Invalid authentication token',
+                    details: error instanceof Error ? error.message : String(error)
+                },
+            })
+        }
     },
     addListener<T, PR extends PrincipalType.WORKER | PrincipalType.USER>(principalType: PR, event: WebsocketServerEvent, handler: WebsocketListener<T, PR>): void {
         switch (principalType) {
@@ -89,7 +165,16 @@ export const websocketService = {
         }
     },
     emitWithAck<T = unknown>(event: WebsocketServerEvent, workerId: string, data?: unknown): Promise<T> {
-        return app!.io.to([workerId]).timeout(4000).emitWithAck(event, data)
+        try {
+            return app!.io.to([workerId]).timeout(4000).emitWithAck(event, data)
+        } catch (error) {
+            console.error('Websocket emitWithAck failed:', {
+                error: error instanceof Error ? error.message : String(error),
+                event,
+                workerId,
+            })
+            throw error
+        }
     },
 }
 
@@ -102,16 +187,30 @@ const validateProjectId = async ({ userId, projectId, log }: ValidateProjectIdAr
             },
         })
     }
-    const role = await projectMemberService(log).getRole({
-        projectId,
-        userId,
-    })
+    
+    try {
+        const role = await projectMemberService(log).getRole({
+            projectId,
+            userId,
+        })
 
-    if (isNil(role)) {
+        if (isNil(role)) {
+            throw new ActivepiecesError({
+                code: ErrorCode.AUTHORIZATION,
+                params: {
+                    message: 'User not allowed to access this project',
+                },
+            })
+        }
+    } catch (error) {
+        if (error instanceof ActivepiecesError) {
+            throw error
+        }
         throw new ActivepiecesError({
             code: ErrorCode.AUTHORIZATION,
             params: {
-                message: 'User not allowed to access this project',
+                message: 'Failed to validate project access',
+                details: error instanceof Error ? error.message : String(error)
             },
         })
     }
